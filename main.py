@@ -12,6 +12,7 @@ Controls
 import sys
 import random
 import math
+import array
 import colorsys
 from collections import deque
 
@@ -19,6 +20,11 @@ import pygame
 
 pygame.init()
 pygame.font.init()
+try:
+    pygame.mixer.init()
+    SOUND_AVAILABLE = True
+except pygame.error:
+    SOUND_AVAILABLE = False
 
 # --------------------------------------------------------------------------
 # Layout / tuning constants
@@ -73,6 +79,71 @@ def fmt(n):
     if n >= 1_000_000:
         return f"{sign}${n / 1_000_000:.2f}M"
     return f"{sign}${n // 1000}k"
+
+
+def make_tone(freq, duration_ms, volume=0.18, sample_rate=22050):
+    total = max(1, int(sample_rate * duration_ms / 1000.0))
+    samples = array.array("h")
+    duration = duration_ms / 1000.0
+    for i in range(total):
+        t = i / sample_rate
+        env = min(1.0, t / 0.015) * max(0.0, 1.0 - (t / duration))
+        value = math.sin(2 * math.pi * freq * t) * 32767 * volume * env
+        samples.append(int(max(-32767, min(32767, value))))
+    return pygame.mixer.Sound(buffer=samples.tobytes())
+
+
+class SoundManager:
+    def __init__(self):
+        self.enabled = SOUND_AVAILABLE
+        self.sounds = {}
+        self.music = None
+        if not self.enabled:
+            return
+        self.sounds = {
+            "menu": make_tone(220, 110, 0.18),
+            "roll": make_tone(330, 120, 0.12),
+            "buy": make_tone(660, 90, 0.16),
+            "upgrade": make_tone(820, 115, 0.18),
+            "takeover": make_tone(160, 200, 0.20),
+            "rent": make_tone(240, 80, 0.12),
+            "event": make_tone(440, 150, 0.18),
+            "raid": make_tone(120, 180, 0.20),
+            "victory": make_tone(523.25, 220, 0.18),
+            "defeat": make_tone(180, 220, 0.18),
+            "step": make_tone(180, 55, 0.04),
+            "menu_music": make_tone(196, 320, 0.07),
+        }
+
+    def play(self, name):
+        if not self.enabled:
+            return
+        sound = self.sounds.get(name)
+        if sound is not None:
+            sound.play()
+
+    def play_music(self, name):
+        if not self.enabled:
+            return
+        if self.music == name:
+            return
+        self.music = name
+        sound = self.sounds.get(name)
+        if sound is not None:
+            sound.play(loops=-1)
+
+    def stop_music(self):
+        if not self.enabled:
+            return
+        if self.music is None:
+            return
+        sound = self.sounds.get(self.music)
+        if sound is not None:
+            sound.stop()
+        self.music = None
+
+
+SFX = SoundManager()
 
 
 # --------------------------------------------------------------------------
@@ -185,6 +256,7 @@ class Player:
 # --------------------------------------------------------------------------
 class Game:
     def __init__(self):
+        self.sound = SFX
         self.board = [[Tile(r, c) for c in range(GRID)] for r in range(GRID)]
         self.districts = {i: [] for i in range(16)}
         for row in self.board:
@@ -214,6 +286,7 @@ class Game:
         self.tick = 0
 
         self.say("Empire war begins. Roll the dice!")
+        self.sound.play("menu")
 
     # ---------------- helpers ----------------
     def say(self, msg):
@@ -283,6 +356,7 @@ class Game:
             self.float_text("FEDERAL RAID!", p.px, p.py - 30, RED)
             self.shake = 22
             self.burst(p.px, p.py, RED, 30)
+            self.sound.play("raid")
             self.settle(p)
 
     # ---------------- actions ----------------
@@ -299,6 +373,7 @@ class Game:
             self.say(f"{p.name} bought {t.name}")
             self.float_text("-" + fmt(t.price), x, y, GOLD)
             self.burst(x, y, p.color, 14)
+            self.sound.play("buy")
         elif t.owner is p:
             cost = self.upgrade_cost(t)
             if t.level >= MAX_LEVEL:
@@ -313,6 +388,7 @@ class Game:
             self.say(f"{p.name} upgraded {t.name} to L{t.level}")
             self.float_text(f"LEVEL {t.level}", x, y, WHITE)
             self.burst(x, y, WHITE, 10)
+            self.sound.play("upgrade")
         else:
             self.say("Rival owns this. Use takeover (T).")
             return False
@@ -339,6 +415,7 @@ class Game:
         self.float_text("TAKEOVER!", x, y, RED)
         self.shake = 14
         self.burst(x, y, p.color, 28)
+        self.sound.play("takeover")
         self.after_acquire(p, t)
         return True
 
@@ -364,6 +441,7 @@ class Game:
         self.add_heat(p, heat)
         self.settle(p)
         self.say(f"{p.name}: {title}")
+        self.sound.play("event")
         sign = "+" if cash >= 0 else ""
         if cash:
             self.float_text(f"{sign}{fmt(cash)}", p.px, p.py - 28, GREEN if cash > 0 else RED)
@@ -379,6 +457,7 @@ class Game:
             self.say(f"{p.name} paid {fmt(rent)} rent")
             self.float_text("-" + fmt(rent), p.px, p.py - 26, RED)
             self.float_text("+" + fmt(rent), o.px, o.py - 26, GREEN)
+            self.sound.play("rent")
             self.settle(p)
         if random.random() < 0.25:
             return self.apply_event(p, random.choice(CARDS))
@@ -607,12 +686,20 @@ class Game:
     def finish(self, title, sub):
         self.result = (title, sub)
         self.state = "GAMEOVER"
+        if title == "VICTORY":
+            self.sound.play("victory")
+        else:
+            self.sound.play("defeat")
 
     # ---------------- update ----------------
     def update(self):
         self.tick += 1
+        prev_pos = (self.you.r, self.you.c)
         self.you.update()
         self.rival.update()
+
+        if (self.you.r, self.you.c) != prev_pos and self.state in ("MOVE", "ACTION"):
+            self.sound.play("step")
 
         if self.state == "ROLL" and self.dice_timer > 0:
             self.dice_timer -= 1
@@ -621,6 +708,7 @@ class Game:
                 self.moves_left = self.dice
                 self.want_land = False
                 self.state = "MOVE"
+                self.sound.play("roll")
                 self.say(f"You rolled a {self.dice}. Move or stop.")
 
         if self.state == "MOVE" and self.you.idle and (self.moves_left == 0 or self.want_land):
@@ -916,8 +1004,10 @@ def main():
             if game is None:
                 if ev.type == pygame.MOUSEBUTTONDOWN and PLAY_BTN.collidepoint(ev.pos):
                     game = Game()
+                    SFX.play("menu")
                 elif ev.type == pygame.KEYDOWN and ev.key in (pygame.K_RETURN, pygame.K_SPACE):
                     game = Game()
+                    SFX.play("menu")
                 continue
             if ev.type == pygame.KEYDOWN:
                 if game.state == "GAMEOVER":
@@ -935,9 +1025,11 @@ def main():
                 game.hover = game.tile_from_pos(ev.pos)
 
         if game is None:
+            SFX.play_music("menu_music")
             draw_menu(canvas)
             screen.blit(canvas, (0, 0))
         else:
+            SFX.stop_music()
             game.update()
             game.draw(canvas)
             ox = oy = 0
